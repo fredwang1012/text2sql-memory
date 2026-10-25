@@ -18,3 +18,7 @@ for the business logic itself.
 ## Status
 
 Not started.
+
+## License
+
+Copyright (c) 2026 Frederick Wang. All rights reserved. See [LICENSE](LICENSE).
