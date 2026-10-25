@@ -1,0 +1,454 @@
+# Hand-written knowledge for the BIRD dev `financial` database (a Czech bank, 1993-1998).
+# Sources allowed: the schema, BIRD's database_description CSVs (the data dictionary shipped with the db), the data
+# itself, and the evidence, questions and SQL of the SEED split only (data/split-financial.json). Eval-split
+# questions were never read.
+# provenance names every source an item's claims rest on, joined with "+" (e.g. "seed:131+docs+data"):
+#   schema    = table and column definitions, types and foreign keys
+#   docs      = BIRD's database_description/*.csv files
+#   data      = checked by querying the database
+#   seed:<id> = the evidence (or, for examples and heuristics, the question and SQL) of that seed-split question
+# status: reviewed = stated by the docs or by seed evidence; draft = inferred from data or from seed SQL patterns.
+db_id: financial
+items:
+
+  # ---- district columns A2..A16 -------------------------------------------------------------------------------
+  - id: fin-001
+    kind: glossary
+    title: district.A2 is the district name
+    terms: [district name, district, branch name, branch location, city, Jesenik, Sokolov, Decin, Hl.m. Praha]
+    body: |
+      district.A2 holds the name of the district, e.g. 'Hl.m. Praha', 'Jesenik', 'Sokolov', 'Decin', 'Brno - mesto'.
+      Filter or return A2 when a question names a district or asks for "the district name" of a branch.
+      Names are ASCII without Czech diacritics; Prague city itself is 'Hl.m. Praha'.
+    provenance: "seed:100+docs+data"
+    status: reviewed
+
+  - id: fin-002
+    kind: glossary
+    title: district.A3 is the region
+    terms: [region, region name, Prague, east Bohemia, north Moravia, central Bohemia, Bohemia, Moravia]
+    body: |
+      district.A3 holds the region that contains the district. Exact spellings (districts per region):
+      'Prague' (1), 'central Bohemia' (12), 'east Bohemia' (11), 'north Bohemia' (10), 'north Moravia' (11),
+      'south Bohemia' (8), 'south Moravia' (14), 'west Bohemia' (10).
+      A question about "the Prague branch" or "clients in east Bohemia" filters A3. Some questions loosely
+      call A3 the "district" when asking which area has the most of something. The central Bohemia districts
+      'Praha - vychod' and 'Praha - zapad' are Prague suburbs, not the Prague region.
+    provenance: "seed:123+seed:131+seed:185+data"
+    status: reviewed
+
+  - id: fin-003
+    kind: glossary
+    title: district.A4 is the number of inhabitants
+    terms: [inhabitants, population, number of inhabitants, residents, populous]
+    body: |
+      district.A4 is the number of inhabitants of the district. It is stored as TEXT, so compare or order it
+      with CAST(A4 AS INTEGER).
+    provenance: "docs+schema"
+    status: reviewed
+
+  - id: fin-004
+    kind: glossary
+    title: district.A5-A8 count municipalities by size
+    terms: [municipalities, number of municipalities, small municipalities, municipality size, towns]
+    body: |
+      Number of municipalities in the district by population size:
+      A5 = municipalities with fewer than 499 inhabitants, A6 = 500-1999, A7 = 2000-9999, A8 = more than 10000.
+      A5, A6 and A7 are stored as TEXT (cast to INTEGER for arithmetic or ordering); A8 is an INTEGER.
+    provenance: "docs+schema"
+    status: reviewed
+
+  - id: fin-005
+    kind: glossary
+    title: district.A9 is undocumented
+    terms: [A9]
+    body: |
+      district.A9 is an INTEGER from 1 to 11 with no documented meaning (the schema description marks it
+      "not useful"). Do not use it to answer a question unless the question names A9.
+    provenance: "data+docs"
+    status: draft
+
+  - id: fin-006
+    kind: glossary
+    title: district.A10 is the ratio of urban inhabitants
+    terms: [urban ratio, ratio of urban inhabitants, urban population, urbanisation, percentage urban]
+    body: |
+      district.A10 is the ratio of urban inhabitants as a percentage (REAL, 33.9 to 100.0; Prague is 100.0).
+    provenance: "docs+data"
+    status: reviewed
+
+  - id: fin-007
+    kind: glossary
+    title: district.A11 is the average salary
+    terms: [average salary, salary, avg salary, highest average salary, wage, income]
+    body: |
+      district.A11 is the average salary in the district (INTEGER, 8110 to 12541). "The branch with the
+      highest average salary" means ORDER BY district.A11 DESC.
+    provenance: "seed:107+docs+data"
+    status: reviewed
+
+  - id: fin-008
+    kind: glossary
+    title: district.A12 is the unemployment rate in 1995
+    terms: [unemployment rate 1995, unemployment 1995, jobless rate 1995, unemployment rate]
+    body: |
+      district.A12 is the unemployment rate in 1995 (REAL, percent). It is NULL for one district (Jesenik),
+      so exclude NULLs when ordering ascending or averaging.
+    provenance: "docs+data"
+    status: reviewed
+
+  - id: fin-009
+    kind: glossary
+    title: district.A13 is the unemployment rate in 1996
+    terms: [unemployment rate 1996, unemployment 1996, jobless rate 1996, highest unemployment, unemployment rate]
+    body: |
+      district.A13 is the unemployment rate in 1996 (REAL, percent). A12 and A13 are the same unemployment
+      measure for 1995 and 1996.
+    provenance: "seed:133+docs"
+    status: reviewed
+
+  - id: fin-010
+    kind: glossary
+    title: district.A14 is entrepreneurs per 1000 inhabitants
+    terms: [entrepreneurs, entrepreneurs per 1000 inhabitants, business owners, self-employed]
+    body: |
+      district.A14 is the number of entrepreneurs per 1000 inhabitants (INTEGER).
+    provenance: "docs"
+    status: reviewed
+
+  - id: fin-011
+    kind: glossary
+    title: district.A15 and A16 are the numbers of crimes committed in 1995 and 1996
+    terms: [crimes 1995, committed crimes 1995, number of crimes 1995, crimes 1996, committed crimes 1996,
+            number of crimes 1996, crime, crimes]
+    body: |
+      district.A15 is the number of crimes committed in 1995 and district.A16 the number committed in 1996
+      (both INTEGER). A15 is NULL for one district (Jesenik).
+      "Second-highest number of crimes in 1995" is ORDER BY A15 DESC LIMIT 1, 1.
+    provenance: "seed:138+docs+data"
+    status: reviewed
+
+  - id: fin-012
+    kind: value_hint
+    title: loan.status codes A, B, C, D
+    terms: [loan status, repayment status, finished loan, running loan, in debt, not paid, paid off, ok so far,
+            bad loan, problem loan, unpaid loan]
+    body: |
+      loan.status:
+      'A' = contract finished, no problems;
+      'B' = contract finished, loan not paid;
+      'C' = running contract, OK so far;
+      'D' = running contract, client in debt.
+      Counts in the data: A 203, B 31, C 403, D 45. Use only the code the question describes: "in debt" is 'D',
+      "finished but not paid" is 'B'; loans with repayment problems of either kind are status IN ('B', 'D').
+    provenance: "seed:131+docs+data"
+    status: reviewed
+
+  - id: fin-013
+    kind: metric
+    title: Active (running) loans
+    terms: [active loan, running loan, running contract, current loan, ongoing loan, outstanding loan]
+    body: |
+      An active loan is a running contract: loan.status IN ('C', 'D'). Finished contracts are
+      status IN ('A', 'B').
+    sql: SELECT * FROM loan WHERE status IN ('C', 'D')
+    provenance: "seed:131"
+    status: reviewed
+
+  - id: fin-014
+    kind: value_hint
+    title: account.frequency codes (statement issuance)
+    terms: [frequency, statement, monthly issuance, weekly issuance, issuance after transaction, monthly statement,
+            weekly statement, statement after transaction]
+    body: |
+      account.frequency is how often statements are issued:
+      'POPLATEK MESICNE' = monthly issuance (4167 accounts);
+      'POPLATEK TYDNE' = weekly issuance (240);
+      'POPLATEK PO OBRATU' = issuance after transaction (93).
+    provenance: "seed:175+docs+data"
+    status: reviewed
+
+  - id: fin-015
+    kind: value_hint
+    title: trans.type codes (credit and withdrawal)
+    terms: [transaction type, credit, withdrawal, debit, incoming, outgoing, withdrawal transactions, deposit]
+    body: |
+      trans.type: 'PRIJEM' = credit (money in); 'VYDAJ' = withdrawal (money out).
+      The data also has 16666 rows with type 'VYBER' (all with operation 'VYBER', cash withdrawal) that the schema
+      description does not mention; a question about "withdrawal transactions" uses type = 'VYDAJ'.
+    provenance: "seed:151+docs+data"
+    status: reviewed
+
+  - id: fin-016
+    kind: value_hint
+    title: trans.operation codes (mode of transaction)
+    terms: [operation, mode of transaction, credit card withdrawal, card withdrawal, withdrawal in cash, cash withdrawal,
+            credit in cash, cash deposit, collection from another bank, remittance to another bank, transfer]
+    body: |
+      trans.operation:
+      'VYBER KARTOU' = credit card withdrawal;
+      'VYBER' = withdrawal in cash;
+      'VKLAD' = credit in cash;
+      'PREVOD Z UCTU' = collection from another bank;
+      'PREVOD NA UCET' = remittance to another bank.
+      operation is NULL for interest credits (exactly the rows with k_symbol = 'UROK').
+    provenance: "seed:145+seed:159+docs+data"
+    status: reviewed
+
+  - id: fin-017
+    kind: value_hint
+    title: trans.k_symbol codes (characterization of the transaction)
+    terms: [k_symbol, characterization, purpose, insurance payment, household payment, statement payment, interest,
+            sanction interest, old-age pension, pension, loan payment]
+    body: |
+      trans.k_symbol:
+      'POJISTNE' = insurance payment; 'SLUZBY' = payment for statement; 'UROK' = interest credited;
+      'SANKC. UROK' = sanction interest if negative balance; 'SIPO' = household payment;
+      'DUCHOD' = old-age pension; 'UVER' = loan payment.
+      Missing values appear both as NULL and as a single space ' '.
+    provenance: "docs+data"
+    status: reviewed
+
+  - id: fin-018
+    kind: value_hint
+    title: order.k_symbol codes (purpose of a permanent order)
+    terms: [order purpose, payment purpose, permanent order, insurance payment, household payment, leasing,
+            loan payment]
+    body: |
+      order.k_symbol: 'POJISTNE' = insurance payment; 'SIPO' = household payment; 'LEASING' = leasing;
+      'UVER' = loan payment. A missing purpose is the empty string '' (1379 orders).
+      order.amount is the debited amount; bank_to and account_to identify the recipient.
+    provenance: "docs+data"
+    status: reviewed
+
+  - id: fin-019
+    kind: value_hint
+    title: client.gender codes
+    terms: [gender, female, male, woman, women, man, men, sex]
+    body: |
+      client.gender is 'F' for female (woman) and 'M' for male (man).
+    provenance: "seed:100+seed:109"
+    status: reviewed
+
+  - id: fin-020
+    kind: value_hint
+    title: disp.type (owner and disponent)
+    terms: [owner, account owner, account holder, disponent, user, disposition, right to issue permanent orders,
+            apply for loans]
+    body: |
+      disp.type is 'OWNER' or 'DISPONENT' (a 'USER' value mentioned in the description does not occur).
+      Only the owner has the right to issue permanent orders or apply for loans. Every account has exactly one
+      OWNER disposition; some also have one DISPONENT. "Who owns the account" means disp.type = 'OWNER'.
+    provenance: "seed:193+docs+data"
+    status: reviewed
+
+  - id: fin-021
+    kind: value_hint
+    title: card.type values
+    terms: [card type, credit card, gold card, classic card, junior card, high-level card, standard card]
+    body: |
+      card.type: 'junior' = junior class card; 'classic' = standard class card; 'gold' = high-level card.
+      card.issued is the issue date. Every card belongs to an OWNER disposition.
+    provenance: "docs+data"
+    status: reviewed
+
+  - id: fin-022
+    kind: convention
+    title: Dates are 'YYYY-MM-DD' text
+    terms: [date, year, opened in, issued in, born in, approved on, in 1997, date format, month]
+    body: |
+      All date columns (account.date, loan.date, trans.date, card.issued, client.birth_date) are stored as TEXT
+      'YYYY-MM-DD' (the description's "YYMMDD" is wrong). Match a day with col = '1998-10-14', a year with
+      STRFTIME('%Y', col) = '1997', and before/after a year with STRFTIME('%Y', col) < '1950'.
+      Ranges: accounts opened 1993-01-01..1997-12-29; transactions 1993-01-01..1998-12-31;
+      loans 1993-07-05..1998-12-08; cards 1993-11-07..1998-12-29; births 1911..1987.
+    provenance: "data+docs"
+    status: draft
+
+  - id: fin-023
+    kind: convention
+    title: Age from birth_date (youngest, oldest)
+    terms: [youngest, oldest, age, older, younger, born, birth date]
+    body: |
+      An earlier client.birth_date means an older client. Oldest = ORDER BY birth_date ASC; youngest =
+      ORDER BY birth_date DESC. Age at a date is STRFTIME('%Y', date) - STRFTIME('%Y', birth_date).
+    provenance: "seed:95+seed:107"
+    status: reviewed
+
+  - id: fin-024
+    kind: convention
+    title: Money amounts and loan terms
+    terms: [amount, USD, dollars, loan amount, approved amount, duration, loan validity, months, monthly payments,
+            balance, balance after transaction]
+    body: |
+      Amounts are in USD. loan.amount is the approved amount; loan.duration is the loan term in months
+      (12, 24, 36, 48 or 60; "loan validity" means duration); loan.payments is the monthly payment
+      (amount = duration * payments). trans.amount is the transaction amount and trans.balance is the account
+      balance after that transaction.
+    provenance: "docs+data"
+    status: reviewed
+
+  - id: fin-025
+    kind: convention
+    title: Branch district of an account versus a client's district
+    terms: [branch, opened the account in, location of branch, account district, client district, live in, stay in]
+    body: |
+      account.district_id is the district of the account's branch; client.district_id is the client's own
+      district. They differ for 494 clients, so the choice changes answers.
+      Heuristic, inferred from seed queries rather than documented: in seed queries, questions about where
+      clients are ("female clients in Jesenik", "clients who stay in east Bohemia", "clients of the Prague
+      branch") joined client.district_id to district, while questions about accounts ("accounts opened in
+      Prague", "how many accounts are from Jesenik") joined account.district_id.
+    provenance: "seed:109+seed:185+seed:190+seed:114+seed:166+data"
+    status: draft
+
+  - id: fin-026
+    kind: convention
+    title: Customers are clients; count client_id
+    terms: [customers, clients, how many clients, number of customers, people]
+    body: |
+      "Customers" means rows of client. Count people with COUNT(client.client_id) and accounts with
+      COUNT(account.account_id).
+    provenance: "seed:100"
+    status: reviewed
+
+  - id: fin-027
+    kind: metric
+    title: Percentage of rows meeting a condition
+    terms: [percentage, proportion, share, ratio, percent, rate of]
+    body: |
+      Compute a percentage as CAST(SUM(condition) AS REAL) * 100 / COUNT(key) over the qualifying rows,
+      e.g. the share of female clients is CAST(SUM(gender = 'F') AS REAL) * 100 / COUNT(client_id).
+    sql: SELECT CAST(SUM(T2.gender = 'F') AS REAL) * 100 / COUNT(T2.client_id) FROM district AS T1 INNER JOIN client AS T2 ON T1.district_id = T2.district_id WHERE T1.A3 = 'Prague'
+    provenance: "seed:185"
+    status: reviewed
+
+  # ---- join paths ----------------------------------------------------------------------------------------------
+  - id: fin-028
+    kind: join_path
+    title: Account or client to district
+    terms: [district, branch, region, average salary, unemployment, crimes, located in]
+    body: |
+      account.district_id = district.district_id gives the branch of an account;
+      client.district_id = district.district_id gives the client's district.
+    sql: SELECT * FROM account AS T1 INNER JOIN district AS T2 ON T1.district_id = T2.district_id
+    provenance: schema
+    status: reviewed
+
+  - id: fin-029
+    kind: join_path
+    title: Client to account through disp
+    terms: [client account, account owner, owner, account holder, whose account, client's transactions]
+    body: |
+      Clients and accounts are linked only through disp: client.client_id = disp.client_id and
+      disp.account_id = account.account_id. Add disp.type = 'OWNER' to get the single owner of an account.
+    sql: SELECT * FROM client AS T1 INNER JOIN disp AS T2 ON T1.client_id = T2.client_id INNER JOIN account AS T3 ON T2.account_id = T3.account_id
+    provenance: "schema+data"
+    status: reviewed
+
+  - id: fin-030
+    kind: join_path
+    title: Card to client and account through disp
+    terms: [card holder, card owner, credit card, card issued, client's card]
+    body: |
+      card.disp_id = disp.disp_id; then disp.client_id leads to client and disp.account_id to account
+      (and from the account to its trans, loan and order rows).
+    sql: SELECT * FROM card AS T1 INNER JOIN disp AS T2 ON T1.disp_id = T2.disp_id INNER JOIN account AS T3 ON T2.account_id = T3.account_id
+    provenance: schema
+    status: reviewed
+
+  - id: fin-031
+    kind: join_path
+    title: Loans, transactions and orders hang off account
+    terms: [loan, transaction, order, permanent order, account of the loan, who placed the order,
+            transactions of the account]
+    body: |
+      loan.account_id, trans.account_id and order.account_id each reference account.account_id. Each account has
+      at most one loan. To reach the client, continue account -> disp -> client (filter disp.type = 'OWNER' for the
+      owner). The permanent-order table is named order, a reserved word: write it as `order` or "order".
+    sql: SELECT * FROM loan AS T1 INNER JOIN account AS T2 ON T1.account_id = T2.account_id INNER JOIN disp AS T3 ON T2.account_id = T3.account_id WHERE T3.type = 'OWNER'
+    provenance: "schema+data"
+    status: reviewed
+
+  # ---- verified examples (seed questions; each returns the gold result) ----------------------------------------
+  - id: fin-032
+    kind: example
+    title: How many clients opened their accounts in Jesenik branch were women?
+    terms: [how many, women, female clients, Jesenik, branch]
+    body: Count female clients whose district (A2) is Jesenik.
+    sql: SELECT COUNT(T1.client_id) FROM client AS T1 INNER JOIN district AS T2 ON T1.district_id = T2.district_id WHERE T1.gender = 'F' AND T2.A2 = 'Jesenik'
+    provenance: "seed:109"
+    status: reviewed
+
+  - id: fin-033
+    kind: example
+    title: For the first client who opened his/her account in Prague, what is his/her account ID?
+    terms: [first account, earliest opened, Prague, account id]
+    body: Earliest account.date among accounts whose branch region (A3) is Prague.
+    sql: SELECT T1.account_id FROM account AS T1 INNER JOIN district AS T2 ON T1.district_id = T2.district_id WHERE T2.A3 = 'Prague' ORDER BY T1.date ASC LIMIT 1
+    provenance: "seed:114"
+    status: reviewed
+
+  - id: fin-034
+    kind: example
+    title: Which district has highest active loan?
+    terms: [active loan, highest, region, running contract]
+    body: Sum the amounts of running loans (status C or D) per region (A3) and take the largest.
+    sql: SELECT T2.A3 FROM account AS T1 INNER JOIN district AS T2 ON T1.district_id = T2.district_id INNER JOIN loan AS T3 ON T1.account_id = T3.account_id WHERE T3.status IN ('C', 'D') GROUP BY T2.A3 ORDER BY SUM(T3.amount) DESC LIMIT 1
+    provenance: "seed:131"
+    status: reviewed
+
+  - id: fin-035
+    kind: example
+    title: In 1996, which districts have the highest unemployment rate? List their branch location and district name.
+    terms: [unemployment rate 1996, highest unemployment, district name, branch location]
+    body: A13 is the 1996 unemployment rate; return district_id and A2 of the top district.
+    sql: SELECT district_id, A2 FROM district ORDER BY A13 DESC LIMIT 1
+    provenance: "seed:133"
+    status: reviewed
+
+  - id: fin-036
+    kind: example
+    title: Account holders with credit card transactions below the average amount in 1998
+    terms: [credit card, card withdrawal, below average, less than average, 1998, account holder]
+    body: Card withdrawals are operation 'VYBER KARTOU'; compare with the average amount of all 1998 transactions.
+    sql: SELECT T1.account_id FROM trans AS T1 INNER JOIN account AS T2 ON T1.account_id = T2.account_id WHERE STRFTIME('%Y', T1.date) = '1998' AND T1.operation = 'VYBER KARTOU' AND T1.amount < (SELECT AVG(amount) FROM trans WHERE STRFTIME('%Y', date) = '1998')
+    provenance: "seed:145"
+    status: reviewed
+
+  - id: fin-037
+    kind: example
+    title: How many accounts have an owner disposition and request for a statement to be generated upon a transaction?
+    terms: [owner, statement after transaction, issuance after transaction, how many accounts]
+    body: Owner dispositions (disp.type 'OWNER') on accounts with frequency 'POPLATEK PO OBRATU'.
+    sql: SELECT COUNT(T1.account_id) FROM account AS T1 INNER JOIN disp AS T2 ON T1.account_id = T2.account_id WHERE T2.type = 'OWNER' AND T1.frequency = 'POPLATEK PO OBRATU'
+    provenance: "seed:175"
+    status: reviewed
+
+  - id: fin-038
+    kind: example
+    title: What proportion of customers who have accounts at the Prague branch are female?
+    terms: [proportion, percentage, female, Prague branch, customers]
+    body: Percentage of female clients among clients whose district is in the Prague region (A3).
+    sql: SELECT CAST(SUM(T2.gender = 'F') AS REAL) / COUNT(T2.client_id) * 100 FROM district AS T1 INNER JOIN client AS T2 ON T1.district_id = T2.district_id WHERE T1.A3 = 'Prague'
+    provenance: "seed:185"
+    status: reviewed
+
+  - id: fin-039
+    kind: example
+    title: How many clients who were born in 1920 stay in east Bohemia?
+    terms: [born in, birth year, east Bohemia, region, how many clients]
+    body: Year of client.birth_date via STRFTIME and region A3 = 'east Bohemia'.
+    sql: SELECT COUNT(T1.client_id) FROM client AS T1 INNER JOIN district AS T2 ON T1.district_id = T2.district_id WHERE STRFTIME('%Y', T1.birth_date) = '1920' AND T2.A3 = 'east Bohemia'
+    provenance: "seed:190"
+    status: reviewed
+
+  - id: fin-040
+    kind: example
+    title: Who is the owner of the account with the largest loan amount?
+    terms: [owner, largest loan, biggest loan, account owner]
+    body: Join the loan to its account and the OWNER disposition; take the client with the largest loan amount.
+    sql: SELECT T1.client_id FROM disp AS T1 INNER JOIN account AS T3 ON T1.account_id = T3.account_id INNER JOIN loan AS T2 ON T3.account_id = T2.account_id WHERE T1.type = 'OWNER' ORDER BY T2.amount DESC LIMIT 1
+    provenance: "seed:156"
+    status: reviewed
+

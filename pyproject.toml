@@ -1,0 +1,26 @@
+[project]
+name = "text2sql-memory"
+version = "0.1.0"
+description = "Text-to-SQL layer that retrieves business logic from a typed knowledge store, evaluated on BIRD"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pydantic-settings>=2.4",
+    "numpy>=2.0",
+    "rank-bm25>=0.2.2",
+    "pyyaml>=6.0",
+    "anthropic>=2.3",
+]
+
+[project.optional-dependencies]
+embed = [
+    "sentence-transformers>=6.1.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
