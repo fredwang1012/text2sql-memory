@@ -86,3 +86,11 @@ def test_seed_main_writes_vectors(tmp_path, monkeypatch):
     seed.main()
     with Store(settings.memory_db) as s:
         assert s.vector("s-1") is not None
+
+
+def test_ask_without_credentials_prints_the_friendly_message(capsys, no_credentials):
+    _bird_data()
+    assert cli.main(["--db-id", "shop", "ask", "--mode", "schema", "how many?"]) == 1
+    err = capsys.readouterr().err
+    assert "ANTHROPIC_API_KEY" in err and "ant auth login" in err
+    assert "Traceback" not in err

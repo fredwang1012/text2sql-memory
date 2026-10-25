@@ -90,6 +90,11 @@ class AnthropicLLM:
             )
         except (anthropic.AuthenticationError, anthropic.CredentialsError) as e:
             raise LLMUnavailable(f"Anthropic API unavailable: {type(e).__name__}") from e
+        except TypeError as e:
+            # with no key and no profile the SDK raises a plain TypeError while building the request
+            if "authentication method" not in str(e):
+                raise
+            raise LLMUnavailable("Anthropic API unavailable: no credentials found") from e
         except anthropic.APIConnectionError as e:  # includes APITimeoutError
             raise LLMTransient(f"Anthropic API not reachable: {type(e).__name__}") from e
         if response.stop_reason == "refusal":

@@ -71,3 +71,21 @@ def test_authentication_errors_are_fatal():
     exc = anthropic.AuthenticationError("bad key", response=response, body=None)
     with pytest.raises(LLMUnavailable):
         _llm_raising(exc).generate("q", "schema", [])
+
+
+def test_real_client_without_credentials_is_unavailable(no_credentials):
+    with pytest.raises(LLMUnavailable):
+        AnthropicLLM().generate("how many?", "CREATE TABLE t (id INTEGER)", [])
+
+
+def test_other_type_errors_are_not_swallowed(monkeypatch):
+    class Boom:
+        class messages:
+            @staticmethod
+            def parse(**kwargs):
+                raise TypeError("something else")
+
+    llm = AnthropicLLM()
+    llm._client = Boom()
+    with pytest.raises(TypeError, match="something else"):
+        llm.generate("q", "s", [])
