@@ -6,7 +6,8 @@ few items that matter, and the model writes SQL with them in front of it. The go
 execution accuracy on BIRD, with the BIRD evidence hidden: the schema alone, and flat RAG over the database's data
 dictionary.
 
-**Status:** Tier 1 (retrieval MVP) is built and tested. The comparison has not been run yet, so there are no numbers.
+**Status:** Tier 1 (retrieval) and Tier 2 (learning from corrections) are built and tested with a fake model. Neither
+experiment has been run against a real model yet, so there are no numbers.
 
 ## Why
 
@@ -104,7 +105,9 @@ The comparison is only meaningful if the knowledge does not contain the answers.
 - BIRD's `database_description` CSVs are a data dictionary that ships with the database, so they may seed knowledge
   (label: `docs`). The per-question evidence of eval questions never may.
 
-Provenance format is validated on import, and a test fails if any item cites an eval-split question.
+Provenance format is validated on import, and a test fails if any item cites an eval-split question. Rules learned from
+corrections (`feedback:<answer>`) inherit the same rule: do not export rules learned on eval-split questions into the
+knowledge file used for the comparison. The learning loop runs on a temporary store, so it never does.
 
 ## Running the comparison
 
@@ -167,6 +170,45 @@ the row limit counts as wrong and is reported as `n_truncated`.
 Pending. The comparison needs an Anthropic API key and the BIRD download, and has not been run yet. The harness itself is tested end to end
 with a fake model, which returns gold SQL only when the needed rule is present, so no numbers are claimed here.
 
+## Learning from corrections
+
+Every `ask` is recorded as a numbered answer. Tell the system whether it was right:
+
+```bash
+py -3.12 -m uv run python -m app.cli good 12
+```
+```bash
+py -3.12 -m uv run python -m app.cli wrong 12 "revenue excludes voided sales" --sql "SELECT ..."
+```
+
+A correction is distilled by the model into at most 3 general rules (not a copy of the question), stored as `draft`
+items with provenance `feedback:<answer>`. A fixed query that runs is kept as a draft `example`. A correction never
+edits an existing rule, so one bad correction cannot overwrite a good one. Drafts are retrieved immediately but rank
+below reviewed and certified items. A draft cited by 2 answers marked good is promoted to `reviewed`; only a person
+certifies. `review` lists the drafts with how often answers citing them were judged good or wrong, and `approve ID`,
+`certify ID` and `reject ID` act on them (a rejected item is archived with its history). `python -m app.seed export`
+writes the store back to `knowledge/<db>.yaml` for review in git.
+
+### The learning curve
+
+```bash
+py -3.12 -m uv run python -m app.learn --json learn.json
+```
+
+This simulates users on BIRD. The eval split is cut again, by a hash of the question id, into a stream and a held-out
+test half (38 and 38 on `financial`). Stream questions are answered one at a time in memory mode. A wrong answer is
+corrected by a simulated user: a model that sees the gold query and its result and must explain the mistake in
+business terms. Corrections that contain SQL are recorded but not learned from, so the gold query cannot leak into
+the store. The correction then goes through the same distillation as a real user's. A right answer confirms the rules
+it cited. Every `--checkpoint-every` stream questions (default 10) the test half is answered with the store as it
+stands. The test half never feeds the store, so its accuracy across checkpoints is the learning curve. The report
+shows it, the store's size by status, accuracy on the stream as it arrived, a schema-only reference on the same test
+questions, and a paired test of the last checkpoint against the first.
+
+`--start empty` begins with no rules, which shows how much the loop recovers on its own; the default begins from
+`knowledge/<db>.yaml`. Other options: `--stream-fraction`, `--limit N`, `--json FILE`, `--yes`. A full run on
+`financial` is roughly 270 to 600 model calls; the exact range is printed before you confirm.
+
 ## Tests
 
 ```bash
@@ -192,10 +234,10 @@ folder.
 1. **Retrieval MVP (built).** Typed store, hand-seeded for one database, term matching plus hybrid retrieval,
    generation and execution, the eval harness with a flat-RAG baseline, paired tests and per-kind ablation. Done when
    memory beats both baselines on `financial` with an interval that excludes zero.
-2. **Learning from usage.** Capture corrections, edits and thumbs; distill a correction into a rule (not just a
-   question and SQL pair) that lands as a draft in a review queue; run a simulated-user loop on BIRD with the evidence
-   hidden, where an LLM user who can see the gold SQL gives corrections. Done when accuracy rises with the number of
-   interactions and plateaus above the baseline. Closest prior work:
+2. **Learning from usage (built).** Corrections and verdicts on answers, distillation into draft rules, a review
+   queue with promotion, and the simulated-user learning curve on BIRD with the evidence hidden. Done when the
+   held-out accuracy rises with the number of interactions and ends above the starting point, with an interval that
+   excludes zero. Closest prior work:
    [Cook et al. 2025](https://arxiv.org/abs/2511.10674).
 3. **Bootstrapping and a graph.** Mine query logs and docs into draft rules; expand retrieval through
    term → metric → column → table → join path; ask a clarifying question when a term has several definitions. Also a
@@ -207,8 +249,8 @@ folder.
    with a budget, rewrites, and efficient patterns learned into memory. Done when BIRD's VES and the estimated cost
    improve without losing execution accuracy.
 
-Also planned for the eval: result sanity checks (empty results, row counts blown up by a bad join), retrieval recall
-of the rules each question needs, and a writeup with the full ablation ladder (schema, flat RAG, typed memory, plus
+Also planned: using the result warnings to trigger a repair, a version of the learning loop that retries the corrected
+question, and a writeup with the full ablation ladder (schema, flat RAG, typed memory, plus
 graph, plus trained retriever).
 
 ## License

@@ -131,6 +131,15 @@ def run_metadata(store: Store | None, db_id: str, docs: Docs | None = None, excl
     return meta
 
 
+def score(res: Result, q: bird.Question, db_file: Path) -> tuple[bool, ExecResult, ExecResult]:
+    """Whether the answer matches the gold result, plus both results, each run without the row cap."""
+    gold = run(db_file, q.sql, max_rows=MAX_ROWS)
+    pred = ExecResult(rows=res.rows, columns=res.columns, error=res.error)
+    if res.truncated and res.sql:  # the pipeline's own row cap is lower; score the full result
+        pred = run(db_file, res.sql, max_rows=MAX_ROWS)
+    return same_result(pred, gold), pred, gold
+
+
 def run_mode(mode: str, questions: list[bird.Question], db_id: str, llm: LLM, store: Store | None = None,
              db_file: Path | None = None, progress: Callable[[dict], None] | None = None,
              docs: Docs | None = None) -> dict:
@@ -156,14 +165,11 @@ def run_mode(mode: str, questions: list[bird.Question], db_id: str, llm: LLM, st
         except Exception as e:  # rate limit, overload, timeout: lose one question, not the run
             res = Result(error=f"{type(e).__name__}: {e}")
             streak += 1
-        gold = run(db_file, q.sql, max_rows=MAX_ROWS)
-        pred = ExecResult(rows=res.rows, columns=res.columns, error=res.error)
-        if res.truncated and res.sql:  # the pipeline's own row cap is lower; score the full result
-            pred = run(db_file, res.sql, max_rows=MAX_ROWS)
+        correct, pred, gold = score(res, q, db_file)
         rows.append({
             "question_id": q.question_id,
             "difficulty": q.difficulty,
-            "correct": same_result(pred, gold),
+            "correct": correct,
             "error": res.error,
             "gold_error": gold.error,
             "truncated": pred.truncated or gold.truncated,
