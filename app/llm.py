@@ -8,7 +8,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from typing import Protocol, TypeVar
+from typing import Literal, Protocol, TypeVar
 
 import anthropic
 from pydantic import BaseModel, ValidationError
@@ -36,6 +36,42 @@ class Draft(BaseModel):
 
 T = TypeVar("T", bound=BaseModel)
 
+DISTILL_PROMPT = """A user corrected the answer of a text-to-SQL system. Turn the correction into business rules that
+will help with OTHER questions on the same database, not only this one.
+
+- Write 0 to 3 rules. Write none when the correction holds nothing reusable.
+- Each rule states one fact: what a column, code or term means (glossary), how a number is computed (metric, with the
+  SQL expression in sql), which tables join on which keys (join_path), a default or rule of thumb (convention), or the
+  exact stored spelling and meaning of values (value_hint).
+- Use only table and column names that appear in the schema. Spell stored values exactly.
+- terms are the words a future question would use for this fact (lowercase).
+- Do not restate a rule that is already listed under existing rules.
+- Do not describe this particular question or its answer; generalise."""
+
+CORRECT_PROMPT = """You are a business analyst checking an answer from a text-to-SQL system. You know the correct query
+and its result; the system does not. Tell the system, in plain business language and at most three sentences, what it
+got wrong and what the right interpretation is: which data, definitions, filters, codes or values.
+
+- Do not write SQL, do not quote the correct query, and do not give the final result values.
+- Speak about meaning (for example "the region is stored in A3 of district", "only owners can issue cards"), so the
+  advice also helps with other questions."""
+
+
+class ProposedRule(BaseModel):
+    kind: Literal["glossary", "metric", "join_path", "convention", "value_hint"]
+    title: str
+    terms: list[str]
+    body: str
+    sql: str | None = None
+
+
+class Distilled(BaseModel):
+    rules: list[ProposedRule]
+
+
+class Correction(BaseModel):
+    text: str
+
 
 class LLMUnavailable(RuntimeError):
     """No usable credentials: nothing else will work either, so a run should stop."""
@@ -55,6 +91,14 @@ class LLM(Protocol):
     def repair(self, question: str, schema_text: str, items: list[Item], sql: str, error: str) -> Draft: ...
 
 
+class Learner(Protocol):
+    """The extra calls of the learning loop: distilling a correction, and (in simulation only) writing one."""
+
+    def distill(self, question: str, schema_text: str, sql: str, correction: str, items: list[Item]) -> list[ProposedRule]: ...
+
+    def correct(self, question: str, schema_text: str, sql: str, rows: str, gold_sql: str, gold_rows: str) -> str: ...
+
+
 def _rules_text(items: list[Item]) -> str:
     if not items:
         return ""
@@ -69,6 +113,17 @@ def _rules_text(items: list[Item]) -> str:
 
 def build_user_text(question: str, schema_text: str, items: list[Item]) -> str:
     return f"Schema:\n{schema_text}\n\n{_rules_text(items)}Question: {question}"
+
+
+def build_distill_text(question: str, schema_text: str, sql: str, correction: str, items: list[Item]) -> str:
+    existing = "\n".join(f"- [{i.id}] ({i.kind}) {i.title}: {i.body}" for i in items) or "(none)"
+    return (f"Schema:\n{schema_text}\n\nExisting rules:\n{existing}\n\nQuestion: {question}\n\n"
+            f"The system's SQL:\n{sql or '(none)'}\n\nThe user's correction: {correction}")
+
+
+def build_correct_text(question: str, schema_text: str, sql: str, rows: str, gold_sql: str, gold_rows: str) -> str:
+    return (f"Schema:\n{schema_text}\n\nQuestion: {question}\n\nThe system's SQL:\n{sql or '(none)'}\n"
+            f"Its result:\n{rows}\n\nThe correct SQL (do not reveal it):\n{gold_sql}\nThe correct result:\n{gold_rows}")
 
 
 def build_repair_text(question: str, schema_text: str, items: list[Item], sql: str, error: str) -> str:
@@ -89,6 +144,14 @@ class _Backend:
 
     def repair(self, question: str, schema_text: str, items: list[Item], sql: str, error: str) -> Draft:
         return self.structured(SYSTEM_PROMPT, build_repair_text(question, schema_text, items, sql, error), Draft)
+
+    def distill(self, question: str, schema_text: str, sql: str, correction: str, items: list[Item]) -> list[ProposedRule]:
+        text = build_distill_text(question, schema_text, sql, correction, items)
+        return self.structured(DISTILL_PROMPT, text, Distilled).rules
+
+    def correct(self, question: str, schema_text: str, sql: str, rows: str, gold_sql: str, gold_rows: str) -> str:
+        text = build_correct_text(question, schema_text, sql, rows, gold_sql, gold_rows)
+        return self.structured(CORRECT_PROMPT, text, Correction).text
 
 
 class AnthropicLLM(_Backend):

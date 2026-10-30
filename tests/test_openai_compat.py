@@ -119,3 +119,17 @@ def test_settings_read_provider_and_hide_the_key(tmp_path):
     s = Settings(_env_file=env)
     assert s.llm_provider == "openai" and s.llm_base_url == "https://openrouter.ai/api/v1"
     assert s.llm_api_key.get_secret_value() == "or-secret" and "or-secret" not in repr(s)
+
+
+def test_distill_and_correct_use_their_own_prompts():
+    from app.llm import CORRECT_PROMPT, DISTILL_PROMPT
+
+    rules = {"rules": [{"kind": "glossary", "title": "Salary", "terms": ["salary"], "body": "A11 is the average salary"}]}
+    llm = Scripted(_reply(json.dumps(rules)), _reply(json.dumps({"text": "Use A11 for salary."})))
+    (rule,) = llm.distill("q", "schema", "SELECT 1", "salary is A11", [])
+    assert rule.title == "Salary" and rule.sql is None
+    assert llm.correct("q", "schema", "SELECT 1", "1", "SELECT A11 FROM district", "9000") == "Use A11 for salary."
+    assert llm.payloads[0]["messages"][0]["content"].startswith(DISTILL_PROMPT)
+    assert "Existing rules:\n(none)" in llm.payloads[0]["messages"][1]["content"]
+    assert llm.payloads[1]["messages"][0]["content"].startswith(CORRECT_PROMPT)
+    assert "do not reveal it" in llm.payloads[1]["messages"][1]["content"]

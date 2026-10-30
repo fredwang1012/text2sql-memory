@@ -14,8 +14,9 @@ KINDS = ("glossary", "metric", "join_path", "convention", "example", "value_hint
 STATUSES = ("draft", "reviewed", "certified")
 SCOPES = ("global", "team", "user")
 
-# provenance is one or more sources joined with "+": schema, docs (BIRD description files), data, or seed:<question_id>
-_SOURCE = r"(?:schema|docs|data|seed:\d+)"
+# provenance is one or more sources joined with "+": schema, docs (BIRD description files), data, seed:<question_id>,
+# or feedback:<answer id> for a rule distilled from a user's correction
+_SOURCE = r"(?:schema|docs|data|seed:\d+|feedback:\d+)"
 _PROVENANCE = re.compile(rf"{_SOURCE}(?:\+{_SOURCE})*")
 
 # fields a user edits; a change to any of them is a new version
@@ -34,6 +35,11 @@ CREATE TABLE IF NOT EXISTS item_versions (
     PRIMARY KEY (id, version)
 );
 CREATE TABLE IF NOT EXISTS item_vectors (id TEXT PRIMARY KEY, vector BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS answers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, db_id TEXT NOT NULL, question TEXT NOT NULL, mode TEXT NOT NULL,
+    sql TEXT NOT NULL, items_used TEXT NOT NULL, created TEXT NOT NULL,
+    verdict TEXT, correction TEXT, fixed_sql TEXT, distilled TEXT NOT NULL DEFAULT '[]', judged TEXT
+);
 CREATE INDEX IF NOT EXISTS items_db_kind ON items (db_id, kind);
 """
 
@@ -76,6 +82,23 @@ class Item:
 def seed_ids(provenance: str) -> list[int]:
     """Seed question ids cited in a provenance string."""
     return [int(p[5:]) for p in provenance.split("+") if p.startswith("seed:")]
+
+
+@dataclass
+class Answer:
+    """One answered question and what the user said about it. verdict is None, "good" or "wrong"."""
+    id: int
+    db_id: str
+    question: str
+    mode: str
+    sql: str
+    items_used: list[str]
+    created: str
+    verdict: str | None = None
+    correction: str | None = None
+    fixed_sql: str | None = None
+    distilled: list[str] = field(default_factory=list)  # ids of the items made from the correction
+    judged: str | None = None
 
 
 def search_text(item: Item) -> str:
@@ -191,6 +214,63 @@ class Store:
         if status is not None:
             sql, args = sql + " AND status = ?", args + [status]
         return [_row_to_item(r) for r in self.conn.execute(sql + " ORDER BY id", args).fetchall()]
+
+    def archive(self, item_id: str) -> None:
+        """Remove an item from use, keeping its last version in the history."""
+        old = self.get(item_id)
+        if old is None:
+            raise KeyError(item_id)
+        with self.conn:
+            archived = asdict(old)
+            archived["terms"] = json.dumps(old.terms, ensure_ascii=False)
+            archived["archived"] = _now()
+            cols = list(_COLUMNS) + ["archived"]
+            self.conn.execute(
+                f"INSERT OR REPLACE INTO item_versions ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                [archived[c] for c in cols],
+            )
+            self.conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+            self.conn.execute("DELETE FROM item_vectors WHERE id = ?", (item_id,))
+
+    def add_answer(self, db_id: str, question: str, mode: str, sql: str, items_used: list[str]) -> Answer:
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO answers (db_id, question, mode, sql, items_used, created) VALUES (?, ?, ?, ?, ?, ?)",
+                (db_id, question, mode, sql, json.dumps(items_used), _now()),
+            )
+        return self.answer(cur.lastrowid)
+
+    def answer(self, answer_id: int) -> Answer | None:
+        row = self.conn.execute("SELECT * FROM answers WHERE id = ?", (answer_id,)).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["items_used"] = json.loads(d["items_used"])
+        d["distilled"] = json.loads(d["distilled"])
+        return Answer(**d)
+
+    def judge(self, answer_id: int, verdict: str, correction: str | None = None, fixed_sql: str | None = None,
+              distilled: list[str] | None = None) -> Answer:
+        if verdict not in ("good", "wrong"):
+            raise ValueError(f"verdict must be good or wrong, got {verdict!r}")
+        if self.answer(answer_id) is None:
+            raise KeyError(answer_id)
+        with self.conn:
+            self.conn.execute(
+                "UPDATE answers SET verdict = ?, correction = ?, fixed_sql = ?, distilled = ?, judged = ? WHERE id = ?",
+                (verdict, correction, fixed_sql, json.dumps(distilled or []), _now(), answer_id),
+            )
+        return self.answer(answer_id)
+
+    def verdict_counts(self, item_id: str) -> dict[str, int]:
+        """How many judged answers cited the item, by verdict."""
+        counts = {"good": 0, "wrong": 0}
+        rows = self.conn.execute(
+            "SELECT verdict, COUNT(*) FROM answers, json_each(answers.items_used) "
+            "WHERE json_each.value = ? AND verdict IS NOT NULL GROUP BY verdict", (item_id,)).fetchall()
+        for verdict, n in rows:
+            counts[verdict] = n
+        return counts
 
     def record_use(self, ids: list[str]) -> None:
         with self.conn:
