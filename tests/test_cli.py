@@ -50,7 +50,7 @@ def test_ask_in_memory_mode_on_an_empty_store_hints_to_seed(capsys, monkeypatch)
         def generate(self, *a):
             return Draft(sql="SELECT COUNT(*) FROM sale", items_used=[], assumptions="")
 
-    monkeypatch.setattr("app.pipeline.AnthropicLLM", Fake)
+    monkeypatch.setattr("app.pipeline.make_llm", Fake)
     assert cli.main(["--db-id", "shop", "ask", "how many sales?"]) == 0
     assert "cli seed" in capsys.readouterr().err
     assert cli.main(["--db-id", "shop", "ask", "--mode", "schema", "how many sales?"]) == 0
@@ -64,7 +64,7 @@ def test_ask_reports_a_connection_failure_briefly(capsys, monkeypatch):
         def generate(self, *a):
             raise LLMTransient("Anthropic API not reachable: APITimeoutError")
 
-    monkeypatch.setattr("app.pipeline.AnthropicLLM", Down)
+    monkeypatch.setattr("app.pipeline.make_llm", Down)
     assert cli.main(["--db-id", "shop", "ask", "--mode", "schema", "how many?"]) == 1
     assert "not reachable" in capsys.readouterr().err
 

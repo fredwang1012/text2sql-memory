@@ -16,8 +16,12 @@ class Settings(BaseSettings):
     data_dir: Path = ROOT / "data"
     # auto: multilingual-e5 embeddings when the "embed" extra is installed, else BM25 only. off: always BM25 only.
     embed: Literal["auto", "off"] = "auto"
+    # anthropic: the Anthropic API. openai: any OpenAI-compatible endpoint at llm_base_url (Ollama, Gemini, OpenRouter)
+    llm_provider: Literal["anthropic", "openai"] = "anthropic"
     llm_model: str = "claude-opus-5-5"
-    llm_effort: str = "medium"
+    llm_effort: str = "medium"  # Anthropic only
+    llm_base_url: str = "http://localhost:11434/v1"  # openai provider only; this default is a local Ollama
+    llm_api_key: SecretStr | None = None  # openai provider only; Ollama needs none
     db_id: str = "financial"
     memory_db: Path | None = None  # defaults to data_dir/memory.db
 

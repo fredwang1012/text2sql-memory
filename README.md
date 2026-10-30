@@ -18,9 +18,10 @@ the meaning in a store that can be reviewed and corrected, and retrieves it per 
 
 ## Quick start
 
-Prerequisites: Python 3.12 with [uv](https://docs.astral.sh/uv/) and an Anthropic API key. The key can go in `.env`
-(`ANTHROPIC_API_KEY=...`) or in the environment. If neither is set, the SDK's own credential lookup is used, such as an
-`ant auth login` profile.
+Prerequisites: Python 3.12 with [uv](https://docs.astral.sh/uv/) and a model to write the SQL: an Anthropic API key,
+or a free option such as a local Ollama model (see [Choosing a model](#choosing-a-model)). An Anthropic key can go in
+`.env` (`ANTHROPIC_API_KEY=...`) or in the environment. If neither is set, the SDK's own credential lookup is used,
+such as an `ant auth login` profile.
 
 ```bash
 py -3.12 -m uv sync                          # or plain: uv sync
@@ -32,9 +33,28 @@ py -3.12 -m uv run python -m app.cli ask "How many clients are in the Prague reg
 py -3.12 -m uv run python -m app.evaluate    # the comparison, see below
 ```
 
-`ask` takes `--mode schema`, `--mode docs` or `--mode memory` (the default) and prints the SQL, the rules it used and the first rows.
-`python -m app.cli items` lists what is stored. Settings come from the environment or `.env`: `LLM_MODEL` (default
-`claude-opus-5-5`), `LLM_EFFORT` (default `medium`), `EMBED` (`auto` or `off`), `DB_ID`, `DATA_DIR` and `MEMORY_DB`.
+`ask` takes `--mode schema`, `--mode docs` or `--mode memory` (the default) and prints the SQL, the rules it used, any
+warnings about the result and the first rows.
+`python -m app.cli items` lists what is stored. Settings come from the environment or `.env`: `LLM_PROVIDER` (see
+below), `LLM_MODEL` (default `claude-opus-5-5`), `LLM_EFFORT` (default `medium`, Anthropic only), `EMBED` (`auto` or
+`off`), `DB_ID`, `DATA_DIR` and `MEMORY_DB`.
+
+### Choosing a model
+
+The comparison needs a model to write the SQL; it does not have to be Claude. `LLM_PROVIDER=anthropic` (the default)
+uses the Anthropic API with structured outputs. `LLM_PROVIDER=openai` uses any OpenAI-compatible `/chat/completions`
+endpoint in JSON mode, set by `LLM_BASE_URL`, `LLM_MODEL` and, when the endpoint needs one, `LLM_API_KEY`:
+
+| Option | Cost | Notes |
+| --- | --- | --- |
+| Ollama, local | Free | No key and no rate limit. A coder model such as Qwen2.5-Coder; the `financial` schema prompt needs a context window of at least 8K tokens. |
+| Gemini API | Free tier | OpenAI-compatible endpoint; limits depend on the model. |
+| OpenRouter `:free` models | Free | Low daily request caps, so a full run can take more than a day. |
+| Anthropic API | Paid | The default. |
+
+Rate limits (HTTP 429) and server errors are retried up to 3 times with backoff, honouring `Retry-After`. Any model
+works for the claim being tested, because every mode uses the same one; numbers from different models are not
+comparable with each other. The model and provider are recorded in `results.json`.
 
 ## How it works
 
@@ -103,8 +123,14 @@ This runs every eval-split question in three modes with the evidence hidden:
 `docs` is the control that matters most. `memory` beating `schema` could just mean "more text helps"; `memory` beating
 `docs` means the typed, curated items help beyond the data dictionary they were partly written from.
 
-It executes the gold and predicted SQL and reports execution accuracy overall and by BIRD difficulty, the error rate and
-the mean number of rules cited per question. Each pair of modes (memory vs schema, docs vs schema, memory vs docs) gets
+It executes the gold and predicted SQL and reports execution accuracy overall and by BIRD difficulty, the error rate,
+the mean number of rules cited per question, and two diagnostics:
+
+- **coverage:** the share of the gold query's columns (join keys left out) that are named anywhere in the items the
+  model was shown. It is a proxy for retrieval recall: low coverage on a wrong answer points at retrieval, high
+  coverage at generation. It reads the gold SQL, so it is measured after the fact and never shown to the model.
+- **warned:** queries that ran but returned no rows, an all-NULL column, or mostly duplicate rows (often a join that
+  fans out). `ask` prints the same warnings. Each pair of modes (memory vs schema, docs vs schema, memory vs docs) gets
 a paired test on the same questions: the EX gap, a 95% bootstrap interval (10,000 resamples of the questions, fixed
 seed), the questions only one side got right, and an exact two-sided McNemar p-value. With 76 questions, one question
 is 1.3 points, so a gap whose interval crosses zero is not a result. `results.json` holds the same plus the SQL, the

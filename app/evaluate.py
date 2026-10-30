@@ -22,10 +22,12 @@ from app.docs import Docs, load_chunks
 from app.embedder import get_embedder
 from app.execute import Result as ExecResult
 from app.execute import run, same_result
-from app.llm import LLM, AnthropicLLM, Draft, LLMUnavailable
+from app.llm import LLM, Draft, LLMUnavailable, make_llm, unavailable_hint
 from app.memory import KINDS, Item, Store
 from app.pipeline import Result, answer
 from app.retrieve import DEFAULT_K
+from app.sanity import coverage, referenced_columns
+from app.schema import introspect
 from app.seed import knowledge_path, load_items
 from app.stats import compare
 from app.textindex import Index
@@ -81,6 +83,9 @@ def _summary(rows: list[dict]) -> dict:
         "ex": _mean([r["correct"] for r in rows]),
         "error_rate": _mean([r["error"] is not None for r in rows]),
         "mean_rules_used": _mean([len(r["items_used"]) for r in rows]),
+        "n_warned": sum(bool(r.get("warnings")) for r in rows),
+        # share of the gold query's (non-key) columns named somewhere in the items shown; None for modes without items
+        "mean_coverage": _mean(cov) if (cov := [r["coverage"] for r in rows if r.get("coverage") is not None]) else None,
         "by_difficulty": {d: {"n": len(v), "ex": _mean([r["correct"] for r in v])} for d, v in sorted(by_diff.items())},
     }
 
@@ -134,6 +139,7 @@ def run_mode(mode: str, questions: list[bird.Question], db_id: str, llm: LLM, st
     consecutive failures."""
     db_file = db_file or bird.db_path(db_id)
     oracle = _OracleLLM(llm, db_id) if mode == ORACLE else None
+    tables = introspect(db_file) if mode in ("docs", "memory") else []
     rows = []
     streak = 0
     for q in questions:
@@ -163,6 +169,9 @@ def run_mode(mode: str, questions: list[bird.Question], db_id: str, llm: LLM, st
             "truncated": pred.truncated or gold.truncated,
             "sql": res.sql,
             "items_used": res.items_used,
+            "items_shown": [i.id for i in res.shown],
+            "warnings": res.warnings,
+            "coverage": coverage(referenced_columns(q.sql, tables), res.shown) if tables else None,
         })
         partial = {"summary": _summary(rows), "questions": rows}
         if progress:
@@ -179,12 +188,14 @@ def comparisons(results: dict[str, dict]) -> dict[str, dict]:
 
 
 def format_report(results: dict[str, dict]) -> str:
-    lines = [f"{'mode':<8} {'n':>4} {'EX':>7} {'errors':>7} {'rules/q':>8}"]
+    lines = [f"{'mode':<8} {'n':>4} {'EX':>7} {'errors':>7} {'rules/q':>8} {'coverage':>9} {'warned':>7}"]
     for mode, r in results.items():
         s = r["summary"]
         label = "oracle*" if mode == ORACLE else mode
         rules = "n/a" if mode == ORACLE else f"{s['mean_rules_used']:.2f}"  # its one rule is not a store item
-        lines.append(f"{label:<8} {s['n']:>4} {s['ex']:>7.1%} {s['error_rate']:>7.1%} {rules:>8}")
+        cov = "n/a" if s.get("mean_coverage") is None else f"{s['mean_coverage']:.1%}"
+        lines.append(f"{label:<8} {s['n']:>4} {s['ex']:>7.1%} {s['error_rate']:>7.1%} {rules:>8} {cov:>9} "
+                     f"{s.get('n_warned', 0):>7}")
     gold_bad = max((r["summary"]["n_gold_error"] for r in results.values()), default=0)
     footer = f"Gold queries that failed to run (counted as wrong): {gold_bad} per mode."
     cut = max((r["summary"]["n_truncated"] for r in results.values()), default=0)
@@ -209,6 +220,8 @@ def format_report(results: dict[str, dict]) -> str:
             lines.append(f"{name:<18} {t['ex_diff']:>+7.1%} {ci:>17} {t['only_a']:>6} {t['only_b']:>7} "
                          f"{t['p_mcnemar']:>7.3f}")
         lines.append("wins/losses: questions only the first/second mode got right. p: exact McNemar, two-sided.")
+    footer += ("\ncoverage: share of the gold query's columns (keys left out) named in the items shown. "
+               "warned: queries that ran but returned no rows, an all-NULL column or mostly duplicate rows.")
     lines.append("\n" + footer)
     if ORACLE in results:
         lines.append("\n* oracle reads the BIRD evidence of the eval questions: an upper-bound reference, not a fair system.")
@@ -227,8 +240,10 @@ def _write_json(path: Path, args, questions: list[bird.Question], modes: list[st
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "db_id": args.db,
+        "provider": settings.llm_provider,
         "model": settings.llm_model,
-        "effort": settings.llm_effort,
+        "effort": settings.llm_effort if settings.llm_provider == "anthropic" else None,
+        "base_url": settings.llm_base_url if settings.llm_provider == "openai" else None,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "modes_requested": modes,
         "oracle": args.oracle,
@@ -273,12 +288,13 @@ def main(argv: list[str] | None = None, llm: LLM | None = None) -> int:
     calls = len(questions) * len(modes)
     print(f"{len(questions)} questions x {len(modes)} modes ({', '.join(modes)}) = {calls} to {2 * calls} LLM calls "
           f"(one call each, a second when the SQL fails to run).")
-    print(f"Model: {settings.llm_model}, effort: {settings.llm_effort}")
+    where = f"effort: {settings.llm_effort}" if settings.llm_provider == "anthropic" else f"at {settings.llm_base_url}"
+    print(f"Model: {settings.llm_model} via {settings.llm_provider}, {where}")
     if not args.yes and input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
         print("Cancelled.")
         return 1
 
-    llm = llm or AnthropicLLM()
+    llm = llm or make_llm()
     results: dict[str, dict] = {}
     store = None
     docs = None
@@ -309,7 +325,7 @@ def main(argv: list[str] | None = None, llm: LLM | None = None) -> int:
             results[mode] = run_mode(mode, questions, args.db, llm, store, progress=progress, docs=docs)
             save()
     except LLMUnavailable:
-        print("The Anthropic API is not available. Set ANTHROPIC_API_KEY or run `ant auth login`.", file=sys.stderr)
+        print(unavailable_hint(), file=sys.stderr)
         return 1
     except TooManyFailures as e:
         results[mode] = e.partial

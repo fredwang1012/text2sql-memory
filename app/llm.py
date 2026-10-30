@@ -1,8 +1,17 @@
-"""SQL generation with the Anthropic API: the prompt, the structured Draft, and a protocol so tests can use a fake."""
-from typing import Protocol
+"""SQL generation: the prompt, the structured Draft, a protocol so tests can use a fake, and two backends.
+
+The Anthropic backend uses structured outputs. The OpenAI-compatible backend talks to any /chat/completions endpoint
+in JSON mode (Ollama, Gemini, OpenRouter, Groq, vLLM and others) and validates the reply against the same model.
+"""
+import json
+import re
+import time
+import urllib.error
+import urllib.request
+from typing import Protocol, TypeVar
 
 import anthropic
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.config import settings
 from app.memory import Item
@@ -23,6 +32,9 @@ class Draft(BaseModel):
     sql: str
     items_used: list[str]
     assumptions: str
+
+
+T = TypeVar("T", bound=BaseModel)
 
 
 class LLMUnavailable(RuntimeError):
@@ -66,7 +78,20 @@ def build_repair_text(question: str, schema_text: str, items: list[Item], sql: s
     )
 
 
-class AnthropicLLM:
+class _Backend:
+    """generate and repair on top of one structured call; subclasses implement structured()."""
+
+    def structured(self, system: str, user_text: str, output: type[T]) -> T:
+        raise NotImplementedError
+
+    def generate(self, question: str, schema_text: str, items: list[Item]) -> Draft:
+        return self.structured(SYSTEM_PROMPT, build_user_text(question, schema_text, items), Draft)
+
+    def repair(self, question: str, schema_text: str, items: list[Item], sql: str, error: str) -> Draft:
+        return self.structured(SYSTEM_PROMPT, build_repair_text(question, schema_text, items, sql, error), Draft)
+
+
+class AnthropicLLM(_Backend):
     def __init__(self):
         self._client: anthropic.Anthropic | None = None
 
@@ -78,15 +103,15 @@ class AnthropicLLM:
             self._client = anthropic.Anthropic(api_key=key.get_secret_value()) if key else anthropic.Anthropic()
         return self._client
 
-    def _parse(self, user_text: str) -> Draft:
+    def structured(self, system: str, user_text: str, output: type[T]) -> T:
         try:
             response = self.client.messages.parse(
                 model=settings.llm_model,
                 max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
+                system=system,
                 messages=[{"role": "user", "content": user_text}],
                 output_config={"effort": settings.llm_effort},
-                output_format=Draft,
+                output_format=output,
             )
         except (anthropic.AuthenticationError, anthropic.CredentialsError) as e:
             raise LLMUnavailable(f"Anthropic API unavailable: {type(e).__name__}") from e
@@ -103,8 +128,90 @@ class AnthropicLLM:
             raise LLMRefusal("the model returned no structured answer")
         return response.parsed_output
 
-    def generate(self, question: str, schema_text: str, items: list[Item]) -> Draft:
-        return self._parse(build_user_text(question, schema_text, items))
 
-    def repair(self, question: str, schema_text: str, items: list[Item], sql: str, error: str) -> Draft:
-        return self._parse(build_repair_text(question, schema_text, items, sql, error))
+MAX_RETRIES = 3  # for rate limits and server errors, which free tiers hit often
+MAX_WAIT_S = 60.0
+_RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504}
+_JSON_OBJECT = re.compile(r"\{.*\}", re.S)
+
+
+def json_instructions(output: type[BaseModel]) -> str:
+    return ("\n\nAnswer with one JSON object and nothing else. It must match this JSON schema:\n"
+            + json.dumps(output.model_json_schema()))
+
+
+def _retry_after(headers) -> float | None:
+    try:
+        return float(headers.get("Retry-After"))
+    except (TypeError, ValueError):
+        return None
+
+
+class OpenAICompatLLM(_Backend):
+    """Any OpenAI-compatible /chat/completions endpoint, in JSON mode. A key is optional (Ollama needs none)."""
+
+    def __init__(self, base_url: str | None = None, model: str | None = None, api_key: str | None = None,
+                 sleep=time.sleep):
+        self.base_url = (base_url or settings.llm_base_url).rstrip("/")
+        self.model = model or settings.llm_model
+        key = settings.llm_api_key
+        self.api_key = api_key if api_key is not None else (key.get_secret_value() if key else None)
+        self.sleep = sleep
+
+    def _send(self, payload: dict) -> dict:
+        """POST the payload; returns the decoded reply. Raises urllib errors as they come."""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(payload).encode(),
+                                     headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _post(self, payload: dict) -> dict:
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                return self._send(payload)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    raise LLMUnavailable(f"{self.base_url} refused the request: HTTP {e.code}") from e
+                if e.code not in _RETRY_STATUS or attempt == MAX_RETRIES:
+                    raise LLMTransient(f"{self.base_url} answered HTTP {e.code}") from e
+                self.sleep(min(_retry_after(e.headers) or 2.0 * 2**attempt, MAX_WAIT_S))
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                raise LLMTransient(f"{self.base_url} not reachable: {e}") from e
+        raise AssertionError("unreachable")
+
+    def structured(self, system: str, user_text: str, output: type[T]) -> T:
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system + json_instructions(output)},
+                         {"role": "user", "content": user_text}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+        }
+        reply = self._post(payload)
+        try:
+            choice = reply["choices"][0]
+            text = choice["message"].get("content") or ""
+        except (KeyError, IndexError, TypeError) as e:
+            raise LLMRefusal("the model returned no answer") from e
+        if choice.get("finish_reason") == "content_filter":
+            raise LLMRefusal("the model refused to answer this question")
+        match = _JSON_OBJECT.search(text)  # tolerate code fences or a stray sentence around the object
+        try:
+            return output.model_validate_json(match.group(0) if match else text)
+        except ValidationError as e:
+            raise LLMRefusal("the model returned no structured answer") from e
+
+
+def make_llm() -> LLM:
+    """The backend chosen by LLM_PROVIDER."""
+    return OpenAICompatLLM() if settings.llm_provider == "openai" else AnthropicLLM()
+
+
+def unavailable_hint() -> str:
+    if settings.llm_provider == "openai":
+        return (f"The model endpoint {settings.llm_base_url} refused the request. Check LLM_API_KEY, LLM_BASE_URL "
+                "and LLM_MODEL.")
+    return "The Anthropic API is not available. Set ANTHROPIC_API_KEY or run `ant auth login`."

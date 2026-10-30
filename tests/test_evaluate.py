@@ -218,7 +218,7 @@ def test_missing_bird_data_gets_a_hint_not_a_traceback(tmp_path, capsys):
 def test_oracle_row_reports_rules_as_na(world, capsys):
     assert evaluate.main(["--db", "shop", "--oracle", "--yes", "--limit", "4"], llm=GatedLLM()) == 0
     line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("oracle*"))
-    assert line.split()[-1] == "n/a"
+    assert line.split()[4:6] == ["n/a", "n/a"]  # columns: mode n EX errors rules/q coverage warned
 
 
 class TimeoutLLM(GatedLLM):
@@ -342,3 +342,15 @@ def test_exclude_kinds_ablates_the_memory_store(world, tmp_path, capsys):
     ex = {m: r["summary"]["ex"] for m, r in data["results"].items()}
     assert ex["memory"] == ex["schema"]  # the only rule was a metric
     assert "without metric" in capsys.readouterr().out
+
+
+def test_coverage_and_warnings_are_recorded(world, tmp_path):
+    out = tmp_path / "r.json"
+    assert evaluate.main(["--db", "shop", "--yes", "--json", str(out)], llm=GatedLLM()) == 0
+    res = json.loads(out.read_text(encoding="utf-8"))["results"]
+    assert res["schema"]["summary"]["mean_coverage"] is None
+    revenue = next(r for r in res["memory"]["questions"] if r["sql"] == GOLD["total revenue"])
+    assert revenue["coverage"] == 1.0 and revenue["items_shown"] == ["rev"]  # gold needs amount; the rule names it
+    count = next(r for r in res["memory"]["questions"] if r["sql"] == GOLD["number of sales"])
+    assert count["coverage"] is None  # COUNT(*) needs no column
+    assert all(r["warnings"] == [] for r in res["memory"]["questions"])

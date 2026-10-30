@@ -6,7 +6,7 @@ from pathlib import Path
 from app import bird
 from app.config import settings
 from app.embedder import get_embedder
-from app.llm import LLMTransient, LLMUnavailable
+from app.llm import LLMTransient, LLMUnavailable, unavailable_hint
 from app.memory import Store
 from app.pipeline import MODES, answer
 from app.seed import import_yaml, knowledge_path
@@ -27,7 +27,7 @@ def _ask(args: argparse.Namespace) -> int:
     try:
         result = answer(args.question, args.db_id, args.mode)
     except LLMUnavailable:
-        print("The Anthropic API is not available. Set ANTHROPIC_API_KEY or run `ant auth login`.", file=sys.stderr)
+        print(unavailable_hint(), file=sys.stderr)
         return 1
     except LLMTransient as e:
         print(f"{e}. Check the connection and try again.", file=sys.stderr)
@@ -41,6 +41,8 @@ def _ask(args: argparse.Namespace) -> int:
     if result.error:
         print(f"\nError: {result.error}")
         return 1
+    for w in result.warnings:
+        print(f"\nWarning: {w}")
     print(f"\nRows ({len(result.rows)}):")
     print(" | ".join(result.columns))
     for row in result.rows[:SHOW_ROWS]:

@@ -8,9 +8,10 @@ from app.config import settings
 from app.docs import Docs
 from app.embedder import get_embedder
 from app.execute import run
-from app.llm import LLM, AnthropicLLM, Draft, LLMRefusal
+from app.llm import LLM, Draft, LLMRefusal, make_llm
 from app.memory import Item, Store
 from app.retrieve import retrieve
+from app.sanity import warnings
 from app.schema import schema_text
 
 MODES = ("schema", "docs", "memory")
@@ -25,6 +26,8 @@ class Result:
     error: str | None = None
     truncated: bool = False  # rows hit the row cap
     explanation: list[str] = field(default_factory=list)  # "<title> (<id>)" per rule used
+    warnings: list[str] = field(default_factory=list)  # the query ran, but the result looks suspicious
+    shown: list[Item] = field(default_factory=list, repr=False)  # every item the model was given
 
 
 def answer(
@@ -40,7 +43,7 @@ def answer(
     baseline); "memory" adds the retrieved business rules."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
-    llm = llm or AnthropicLLM()
+    llm = llm or make_llm()
     db_file = db_file or bird.db_path(db_id)
     own_store = None
     if store is None and mode == "memory":
@@ -56,14 +59,14 @@ def answer(
         try:
             draft = llm.generate(question, schema, items)
         except LLMRefusal as e:
-            return Result(error=str(e))
+            return Result(error=str(e), shown=items)
         outcome = run(db_file, draft.sql)
         if outcome.error:
             try:
                 retry = llm.repair(question, schema, items, draft.sql, outcome.error)
             except LLMRefusal as e:
                 # keep the first attempt and its error, and note the refusal
-                return Result(sql=draft.sql, error=f"{outcome.error} (repair refused: {e})")
+                return Result(sql=draft.sql, error=f"{outcome.error} (repair refused: {e})", shown=items)
             draft = retry
             outcome = run(db_file, draft.sql)
         known = _cited(items, draft)
@@ -77,6 +80,8 @@ def answer(
             error=outcome.error,
             truncated=outcome.truncated,
             explanation=[f"{i.title} ({i.id})" for i in known],
+            warnings=warnings(outcome),
+            shown=items,
         )
     finally:
         if own_store is not None:
