@@ -24,6 +24,10 @@ def world(tmp_path, monkeypatch):
     conn.executescript("CREATE TABLE sale (id INTEGER PRIMARY KEY, amount REAL); INSERT INTO sale VALUES (1,2.5),(2,4);")
     conn.commit()
     conn.close()
+    (db_dir / "database_description").mkdir()
+    (db_dir / "database_description" / "sale.csv").write_bytes(
+        "original_column_name,column_name,column_description,data_format,value_description\n"
+        "id,,sale id,integer,\namount,,amount of the sale,real,\n".encode("utf-8-sig"))
     rows = []
     for i in range(30):
         kind = "total revenue" if i % 2 else "number of sales"
@@ -106,7 +110,7 @@ def test_prompt_declined_without_yes(world, monkeypatch, capsys):
     llm = GatedLLM()
     assert evaluate.main(["--db", "shop", "--limit", "2"], llm=llm) == 1
     out = capsys.readouterr().out
-    assert "2 questions x 2 modes" in out and "4 to 8 LLM calls" in out and settings.llm_model in out
+    assert "2 questions x 3 modes" in out and "6 to 12 LLM calls" in out and settings.llm_model in out
     assert llm.seen == []
 
 
@@ -302,3 +306,39 @@ def test_truncated_scoring_is_wrong_and_counted(world, monkeypatch):
     out = evaluate.run_mode("schema", _with_gold(sql), "shop", RowsLLM(sql))
     assert out["summary"]["correct"] == 0 and out["summary"]["n_truncated"] == 3
     assert "cut off" in evaluate.format_report({"schema": out})
+
+
+def test_docs_baseline_and_paired_tests_are_reported(world, tmp_path, capsys):
+    out = tmp_path / "r.json"
+    assert evaluate.main(["--db", "shop", "--yes", "--json", str(out)], llm=GatedLLM()) == 0
+    data = json.loads(out.read_text(encoding="utf-8"))
+    ex = {m: r["summary"]["ex"] for m, r in data["results"].items()}
+    assert ex["docs"] == ex["schema"] < ex["memory"]  # the fake needs the typed rule, not the column description
+    assert data["results"]["docs"]["summary"]["mean_rules_used"] > 0
+    assert data["run"]["docs_chunks"] == 2 and data["run"]["docs_retrieval_mode"] == "bm25"
+    tests = data["comparisons"]
+    assert set(tests) == {"memory vs schema", "docs vs schema", "memory vs docs"}
+    assert tests["memory vs schema"]["only_b"] == 0 and tests["memory vs schema"]["only_a"] > 0
+    assert tests["docs vs schema"]["p_mcnemar"] == 1.0
+    shown = capsys.readouterr().out
+    assert "paired test" in shown and "memory vs docs" in shown and "McNemar" in shown
+
+
+def test_docs_mode_without_description_files_stops_early(world, capsys):
+    import shutil
+
+    shutil.rmtree(bird.db_path("shop").parent / "database_description")
+    assert evaluate.main(["--db", "shop", "--yes"], llm=GatedLLM()) == 1
+    assert "database_description" in capsys.readouterr().err
+    assert evaluate.main(["--db", "shop", "--yes", "--modes", "schema", "memory"], llm=GatedLLM()) == 0
+
+
+def test_exclude_kinds_ablates_the_memory_store(world, tmp_path, capsys):
+    out = tmp_path / "r.json"
+    args = ["--db", "shop", "--yes", "--modes", "schema", "memory", "--exclude-kinds", "metric", "--json", str(out)]
+    assert evaluate.main(args, llm=GatedLLM()) == 0
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["run"]["excluded_kinds"] == ["metric"]
+    ex = {m: r["summary"]["ex"] for m, r in data["results"].items()}
+    assert ex["memory"] == ex["schema"]  # the only rule was a metric
+    assert "without metric" in capsys.readouterr().out

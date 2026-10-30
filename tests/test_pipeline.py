@@ -214,3 +214,15 @@ def test_cli_without_credentials_is_friendly(monkeypatch, capsys, db):
     assert cli_main(["ask", "q", "--mode", "schema"]) == 1
     err = capsys.readouterr().err
     assert "ANTHROPIC_API_KEY" in err and "ant auth login" in err and "Traceback" not in err
+
+
+def test_docs_mode_passes_doc_chunks_and_never_touches_the_store(db, store):
+    from app.docs import Docs
+
+    chunk = Item(id="doc:sale.amount", db_id="shop", kind="glossary", title="sale.amount",
+                 body="Column amount of table sale. Description: revenue of the sale", provenance="docs")
+    fake = FakeLLM([draft("SELECT SUM(amount) FROM sale", ["doc:sale.amount", "r-1"])])
+    res = answer("what is the revenue", "shop", "docs", llm=fake, store=store, db_file=db, docs=Docs([chunk]))
+    assert fake.calls == [("generate", ["doc:sale.amount"])]
+    assert res.items_used == ["doc:sale.amount"]  # r-1 was not shown, so citing it does not count
+    assert store.get("r-1").uses == 0

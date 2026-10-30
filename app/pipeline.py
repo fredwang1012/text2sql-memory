@@ -1,9 +1,11 @@
-"""Question to answer: retrieve rules (memory mode), generate SQL, run it read-only, repair once on error."""
+"""Question to answer: retrieve rules (memory mode) or doc chunks (docs mode), generate SQL, run it read-only, repair
+once on error."""
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from app import bird
 from app.config import settings
+from app.docs import Docs
 from app.embedder import get_embedder
 from app.execute import run
 from app.llm import LLM, AnthropicLLM, Draft, LLMRefusal
@@ -11,7 +13,7 @@ from app.memory import Item, Store
 from app.retrieve import retrieve
 from app.schema import schema_text
 
-MODES = ("schema", "memory")
+MODES = ("schema", "docs", "memory")
 
 
 @dataclass
@@ -32,8 +34,10 @@ def answer(
     llm: LLM | None = None,
     store: Store | None = None,
     db_file: Path | None = None,
+    docs: Docs | None = None,
 ) -> Result:
-    """mode "schema" gives the model the schema only; "memory" adds the retrieved business rules."""
+    """mode "schema" gives the model the schema only; "docs" adds the closest data-dictionary chunks (the flat-RAG
+    baseline); "memory" adds the retrieved business rules."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
     llm = llm or AnthropicLLM()
@@ -42,7 +46,12 @@ def answer(
     if store is None and mode == "memory":
         store = own_store = Store(settings.memory_db, embedder=get_embedder())
     try:
-        items: list[Item] = [r.item for r in retrieve(question, store, db_id)] if mode == "memory" else []
+        if mode == "memory":
+            items: list[Item] = [r.item for r in retrieve(question, store, db_id)]
+        elif mode == "docs":
+            items = (docs or Docs.load(db_id, get_embedder())).retrieve(question)
+        else:
+            items = []
         schema = schema_text(db_file)
         try:
             draft = llm.generate(question, schema, items)
@@ -57,8 +66,8 @@ def answer(
                 return Result(sql=draft.sql, error=f"{outcome.error} (repair refused: {e})")
             draft = retry
             outcome = run(db_file, draft.sql)
-        known = _known_items(store, draft) if mode == "memory" else []  # schema mode never reports or counts rules
-        if not outcome.error and known:
+        known = _cited(items, draft)
+        if mode == "memory" and not outcome.error and known:
             store.record_use([i.id for i in known])
         return Result(
             sql=draft.sql,
@@ -74,16 +83,12 @@ def answer(
             own_store.close()
 
 
-def _known_items(store: Store | None, draft: Draft) -> list[Item]:
-    """Items the model cited that exist in the store; invented and repeated ids are dropped."""
-    if store is None:
-        return []
+def _cited(items: list[Item], draft: Draft) -> list[Item]:
+    """Items the model cited out of those it was shown, in citation order; invented and repeated ids are dropped."""
+    shown = {i.id: i for i in items}
     found, seen = [], set()
     for item_id in draft.items_used:
-        if item_id in seen:
-            continue
-        seen.add(item_id)
-        item = store.get(item_id)
-        if item is not None:
-            found.append(item)
+        if item_id in shown and item_id not in seen:
+            seen.add(item_id)
+            found.append(shown[item_id])
     return found

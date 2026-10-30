@@ -2,8 +2,11 @@
 
 A text-to-SQL layer that retrieves business logic, not just schema. The knowledge lives in a typed, versioned store of
 glossary terms, metric definitions, join paths, conventions, verified examples and value hints. A question pulls the
-few items that matter, and the model writes SQL with them in front of it. The goal is to beat a schema-only baseline
-on execution accuracy on BIRD, with the BIRD evidence hidden.
+few items that matter, and the model writes SQL with them in front of it. The goal is to beat two baselines on
+execution accuracy on BIRD, with the BIRD evidence hidden: the schema alone, and flat RAG over the database's data
+dictionary.
+
+**Status:** Tier 1 (retrieval MVP) is built and tested. The comparison has not been run yet, so there are no numbers.
 
 ## Why
 
@@ -29,7 +32,7 @@ py -3.12 -m uv run python -m app.cli ask "How many clients are in the Prague reg
 py -3.12 -m uv run python -m app.evaluate    # the comparison, see below
 ```
 
-`ask` takes `--mode schema` or `--mode memory` (the default) and prints the SQL, the rules it used and the first rows.
+`ask` takes `--mode schema`, `--mode docs` or `--mode memory` (the default) and prints the SQL, the rules it used and the first rows.
 `python -m app.cli items` lists what is stored. Settings come from the environment or `.env`: `LLM_MODEL` (default
 `claude-opus-5-5`), `LLM_EFFORT` (default `medium`), `EMBED` (`auto` or `off`), `DB_ID`, `DATA_DIR` and `MEMORY_DB`.
 
@@ -89,13 +92,33 @@ Provenance format is validated on import, and a test fails if any item cites an 
 py -3.12 -m uv run python -m app.evaluate --json results.json
 ```
 
-This runs every eval-split question in `schema` and `memory` mode with the evidence hidden, executes the gold and
-predicted SQL, and reports execution accuracy overall and by BIRD difficulty, the error rate and the mean number of
-rules used per question. `results.json` holds the same plus the SQL, the item ids and the outcome of every question.
-Options: `--db`, `--modes schema memory`, `--limit N`, `--json FILE`, `--oracle` and `--yes`.
+This runs every eval-split question in three modes with the evidence hidden:
+
+| Mode | What the model gets besides the schema |
+| --- | --- |
+| `schema` | Nothing. |
+| `docs` | Flat RAG: the 8 closest chunks of BIRD's `database_description` CSVs, one chunk per column, found by the same hybrid search. No item types, no term matching, no seed-split knowledge, no examples. |
+| `memory` | The 8 items retrieved from the typed store. |
+
+`docs` is the control that matters most. `memory` beating `schema` could just mean "more text helps"; `memory` beating
+`docs` means the typed, curated items help beyond the data dictionary they were partly written from.
+
+It executes the gold and predicted SQL and reports execution accuracy overall and by BIRD difficulty, the error rate and
+the mean number of rules cited per question. Each pair of modes (memory vs schema, docs vs schema, memory vs docs) gets
+a paired test on the same questions: the EX gap, a 95% bootstrap interval (10,000 resamples of the questions, fixed
+seed), the questions only one side got right, and an exact two-sided McNemar p-value. With 76 questions, one question
+is 1.3 points, so a gap whose interval crosses zero is not a result. `results.json` holds the same plus the SQL, the
+item ids and the outcome of every question.
+
+Options: `--db`, `--modes schema docs memory`, `--limit N`, `--json FILE`, `--oracle`, `--exclude-kinds KIND ...` and
+`--yes`.
+
+**Ablation.** `--exclude-kinds` leaves item kinds out of the memory store for that run, for example
+`--modes memory --exclude-kinds example value_hint`. Run it once per kind to see which kinds carry the gain. The
+excluded kinds are recorded in `results.json`.
 
 Per mode, every question costs one LLM call, or two if the first SQL fails to run, so the total is questions x modes
-(times one to two). The harness prints the number of calls, the model and the effort first and asks for confirmation;
+(times one to two): 228 to 456 calls for a full three-mode run on `financial`. The harness prints the number of calls, the model and the effort first and asks for confirmation;
 `--yes` skips the prompt. Try `--limit 5` before a full run.
 
 Memory mode always seeds a temporary store from `knowledge/<db>.yaml`, so a run is reproducible from the committed
@@ -115,7 +138,7 @@ the row limit counts as wrong and is reported as `n_truncated`.
 
 ### Results
 
-Pending. The comparison needs an Anthropic API key and has not been run yet. The harness itself is tested end to end
+Pending. The comparison needs an Anthropic API key and the BIRD download, and has not been run yet. The harness itself is tested end to end
 with a fake model, which returns gold SQL only when the needed rule is present, so no numbers are claimed here.
 
 ## Tests
@@ -140,14 +163,27 @@ folder.
 
 ## Roadmap
 
-- Run the comparison and publish the numbers, with an ablation per item type.
-- Tier 2, learning: distill user corrections into reviewable, versioned items and chart accuracy over a simulated
-  stream of corrections.
-- Tier 3, schema editor: an LLM drafts table and column descriptions, editable in a UI, with a setup chatbot that asks
-  about ambiguous columns and writes the answers back.
-- Tier 4, serving: MCP access and cost-aware execution (EXPLAIN checks, rewrites, learned efficient patterns).
-- Tier 5, stretch: a retriever trained on usage logs, and a writeup with ablations (no memory, flat RAG, typed memory,
-  typed memory plus graph).
+1. **Retrieval MVP (built).** Typed store, hand-seeded for one database, term matching plus hybrid retrieval,
+   generation and execution, the eval harness with a flat-RAG baseline, paired tests and per-kind ablation. Done when
+   memory beats both baselines on `financial` with an interval that excludes zero.
+2. **Learning from usage.** Capture corrections, edits and thumbs; distill a correction into a rule (not just a
+   question and SQL pair) that lands as a draft in a review queue; run a simulated-user loop on BIRD with the evidence
+   hidden, where an LLM user who can see the gold SQL gives corrections. Done when accuracy rises with the number of
+   interactions and plateaus above the baseline. Closest prior work:
+   [Cook et al. 2025](https://arxiv.org/abs/2511.10674).
+3. **Bootstrapping and a graph.** Mine query logs and docs into draft rules; expand retrieval through
+   term → metric → column → table → join path; ask a clarifying question when a term has several definitions. Also a
+   schema editor: an LLM drafts table and column descriptions, editable in a UI, with a setup chatbot that asks about
+   ambiguous columns.
+4. **Training the retriever.** Log (question, rules used, accepted) triples and fine-tune the embedder or a reranker
+   on them. The business logic stays in the editable store; only finding it gets learned.
+5. **Serving and cost-aware execution.** An MCP server for the store and the query tool; EXPLAIN-based cost checks
+   with a budget, rewrites, and efficient patterns learned into memory. Done when BIRD's VES and the estimated cost
+   improve without losing execution accuracy.
+
+Also planned for the eval: result sanity checks (empty results, row counts blown up by a bad join), retrieval recall
+of the rules each question needs, and a writeup with the full ablation ladder (schema, flat RAG, typed memory, plus
+graph, plus trained retriever).
 
 ## License
 

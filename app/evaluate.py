@@ -1,7 +1,9 @@
 """Execution-accuracy comparison on the EVAL split of a BIRD database, with the question's evidence hidden.
 
-Modes: schema (schema only), memory (schema plus retrieved rules) and, with --oracle, the BIRD evidence handed to the
-model as a single rule. The oracle row is an upper-bound reference, not a fair system: it reads eval evidence.
+Modes: schema (schema only), docs (schema plus the closest data-dictionary chunks: the flat-RAG baseline), memory
+(schema plus retrieved rules) and, with --oracle, the BIRD evidence handed to the model as a single rule. The oracle row
+is an upper-bound reference, not a fair system: it reads eval evidence. Each pair of fair modes is compared with an
+exact McNemar test and a bootstrap interval on the EX gap.
 """
 import argparse
 import hashlib
@@ -16,18 +18,22 @@ from pathlib import Path
 
 from app import bird
 from app.config import settings
+from app.docs import Docs, load_chunks
 from app.embedder import get_embedder
 from app.execute import Result as ExecResult
 from app.execute import run, same_result
 from app.llm import LLM, AnthropicLLM, Draft, LLMUnavailable
-from app.memory import Item, Store
+from app.memory import KINDS, Item, Store
 from app.pipeline import Result, answer
 from app.retrieve import DEFAULT_K
-from app.seed import import_yaml, knowledge_path
+from app.seed import knowledge_path, load_items
+from app.stats import compare
 from app.textindex import Index
 
 ORACLE = "oracle"
-MODES = ("schema", "memory")
+MODES = ("schema", "docs", "memory")
+# (A, B) pairs reported when both ran: does A beat B on the same questions
+COMPARISONS = (("memory", "schema"), ("docs", "schema"), ("memory", "docs"))
 MAX_ROWS = 10**7  # effectively uncapped when scoring: a capped gold and prediction would compare different row subsets
 MAX_FAILURES = 5  # consecutive per-question failures before the run is abandoned
 
@@ -85,12 +91,15 @@ def eval_questions(db_id: str, limit: int | None = None) -> list[bird.Question]:
     return eval_qs[:limit] if limit else eval_qs
 
 
-def open_eval_store(db_id: str, tmp_dir: Path, embedder=None) -> tuple[Store, str]:
+def open_eval_store(db_id: str, tmp_dir: Path, embedder=None, exclude_kinds: tuple[str, ...] = ()) -> tuple[Store, str]:
     """A throwaway store seeded from knowledge/<db_id>.yaml, so a run is reproducible from the committed file and
-    never touches the real store or its use counts."""
+    never touches the real store or its use counts. Items of the excluded kinds are left out (the ablation)."""
     store = Store(tmp_dir / "memory-eval.db", embedder=embedder)
-    added = import_yaml(store, knowledge_path(db_id))["added"]
-    return store, f"seeded from {knowledge_path(db_id)} ({added} items)"
+    items = [i for i in load_items(knowledge_path(db_id)) if i.kind not in exclude_kinds]
+    for item in items:
+        store.upsert(item)
+    note = f", without {', '.join(exclude_kinds)}" if exclude_kinds else ""
+    return store, f"seeded from {knowledge_path(db_id)} ({len(items)} items{note})"
 
 
 def _git_commit() -> str | None:
@@ -102,20 +111,24 @@ def _git_commit() -> str | None:
     return (out.stdout.strip() or None) if out.returncode == 0 else None
 
 
-def run_metadata(store: Store | None, db_id: str) -> dict:
-    """What the memory results depend on: the retrieval mode actually in use, the knowledge file and the code."""
-    meta: dict = {"k": DEFAULT_K, "git_commit": _git_commit()}
+def run_metadata(store: Store | None, db_id: str, docs: Docs | None = None, exclude_kinds: tuple[str, ...] = ()) -> dict:
+    """What the results depend on: the retrieval mode actually in use, the knowledge file, any ablation and the code."""
+    meta: dict = {"k": DEFAULT_K, "git_commit": _git_commit(), "excluded_kinds": list(exclude_kinds)}
     path = knowledge_path(db_id)
     meta["knowledge_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
     meta["retrieval_mode"] = None
     if store is not None:
         items = store.list(db_id)
         meta["retrieval_mode"] = Index(items, [store.vector(i.id) for i in items], store.embedder).mode
+    if docs is not None:
+        meta["docs_chunks"] = len(docs.chunks)
+        meta["docs_retrieval_mode"] = docs.index.mode
     return meta
 
 
 def run_mode(mode: str, questions: list[bird.Question], db_id: str, llm: LLM, store: Store | None = None,
-             db_file: Path | None = None, progress: Callable[[dict], None] | None = None) -> dict:
+             db_file: Path | None = None, progress: Callable[[dict], None] | None = None,
+             docs: Docs | None = None) -> dict:
     """Run one mode over the questions. Only the question text reaches the pipeline, except in oracle mode.
     progress gets the partial results after every question; TooManyFailures is raised after MAX_FAILURES
     consecutive failures."""
@@ -130,7 +143,7 @@ def run_mode(mode: str, questions: list[bird.Question], db_id: str, llm: LLM, st
                 res = answer(q.question, db_id, "schema", llm=oracle, db_file=db_file)
             else:
                 res = answer(q.question, db_id, mode, llm=llm, store=store if mode == "memory" else None,
-                             db_file=db_file)
+                             db_file=db_file, docs=docs)
             streak = 0
         except LLMUnavailable:
             raise  # no credentials at all: nothing else will work either
@@ -159,6 +172,12 @@ def run_mode(mode: str, questions: list[bird.Question], db_id: str, llm: LLM, st
     return {"summary": _summary(rows), "questions": rows}
 
 
+def comparisons(results: dict[str, dict]) -> dict[str, dict]:
+    """Paired tests for every pair in COMPARISONS that ran, keyed "A vs B"."""
+    return {f"{a} vs {b}": compare(results[a]["questions"], results[b]["questions"])
+            for a, b in COMPARISONS if a in results and b in results}
+
+
 def format_report(results: dict[str, dict]) -> str:
     lines = [f"{'mode':<8} {'n':>4} {'EX':>7} {'errors':>7} {'rules/q':>8}"]
     for mode, r in results.items():
@@ -181,6 +200,15 @@ def format_report(results: dict[str, dict]) -> str:
                 b = r["summary"]["by_difficulty"].get(d)
                 cells.append(f"{b['ex']:>9.1%}" if b else f"{'-':>9}")
             lines.append(f"{d:<18}" + "".join(cells))
+    tests = comparisons(results)
+    if tests:
+        lines.append("")
+        lines.append(f"{'paired test':<18} {'gap':>7} {'95% CI':>17} {'wins':>6} {'losses':>7} {'p':>7}")
+        for name, t in tests.items():
+            ci = f"[{t['ci95'][0]:+.1%}, {t['ci95'][1]:+.1%}]"
+            lines.append(f"{name:<18} {t['ex_diff']:>+7.1%} {ci:>17} {t['only_a']:>6} {t['only_b']:>7} "
+                         f"{t['p_mcnemar']:>7.3f}")
+        lines.append("wins/losses: questions only the first/second mode got right. p: exact McNemar, two-sided.")
     lines.append("\n" + footer)
     if ORACLE in results:
         lines.append("\n* oracle reads the BIRD evidence of the eval questions: an upper-bound reference, not a fair system.")
@@ -211,6 +239,7 @@ def _write_json(path: Path, args, questions: list[bird.Question], modes: list[st
         "run": meta,
         "aborted": aborted,
         "results": results,
+        "comparisons": comparisons(results),
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -220,6 +249,8 @@ def main(argv: list[str] | None = None, llm: LLM | None = None) -> int:
     p.add_argument("--db", default=settings.db_id)
     p.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     p.add_argument("--oracle", action="store_true", help="also run the evidence upper-bound reference")
+    p.add_argument("--exclude-kinds", nargs="+", choices=KINDS, default=[], metavar="KIND",
+                   help=f"ablation: leave these item kinds out of the memory store ({', '.join(KINDS)})")
     p.add_argument("--limit", type=_positive, default=None, help="only the first N eval questions")
     p.add_argument("--json", type=Path, default=None, help="write the summary and per-question detail here")
     p.add_argument("--yes", action="store_true", help="skip the cost confirmation")
@@ -233,6 +264,12 @@ def main(argv: list[str] | None = None, llm: LLM | None = None) -> int:
         print(f"No eval questions for {args.db}. Run scripts/get_bird.py first.", file=sys.stderr)
         return 1
     modes = list(dict.fromkeys(args.modes)) + ([ORACLE] if args.oracle else [])
+    exclude = tuple(dict.fromkeys(args.exclude_kinds))
+    chunks = load_chunks(args.db) if "docs" in modes else []
+    if "docs" in modes and not chunks:
+        print(f"No data-dictionary files for {args.db} (database_description/*.csv), so docs mode cannot run. "
+              "Rerun scripts/get_bird.py or leave docs out of --modes.", file=sys.stderr)
+        return 1
     calls = len(questions) * len(modes)
     print(f"{len(questions)} questions x {len(modes)} modes ({', '.join(modes)}) = {calls} to {2 * calls} LLM calls "
           f"(one call each, a second when the SQL fails to run).")
@@ -244,6 +281,7 @@ def main(argv: list[str] | None = None, llm: LLM | None = None) -> int:
     llm = llm or AnthropicLLM()
     results: dict[str, dict] = {}
     store = None
+    docs = None
     meta: dict = {}
     aborted = None
     status = 0
@@ -260,12 +298,15 @@ def main(argv: list[str] | None = None, llm: LLM | None = None) -> int:
 
     try:
         if "memory" in modes:
-            store, source = open_eval_store(args.db, Path(tmp.name), get_embedder())
+            store, source = open_eval_store(args.db, Path(tmp.name), get_embedder(), exclude)
             print(f"Memory store for this run: {source}. The real store is not modified.")
-        meta = run_metadata(store, args.db)
+        if "docs" in modes:
+            docs = Docs(chunks, get_embedder())  # after the confirmation: embedding the chunks can take a while
+            print(f"Docs baseline: {len(docs.chunks)} column descriptions ({docs.index.mode} retrieval).")
+        meta = run_metadata(store, args.db, docs, exclude)
         for mode in modes:
             print(f"Running {mode}...", flush=True)
-            results[mode] = run_mode(mode, questions, args.db, llm, store, progress=progress)
+            results[mode] = run_mode(mode, questions, args.db, llm, store, progress=progress, docs=docs)
             save()
     except LLMUnavailable:
         print("The Anthropic API is not available. Set ANTHROPIC_API_KEY or run `ant auth login`.", file=sys.stderr)
